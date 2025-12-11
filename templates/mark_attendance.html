@@ -1,0 +1,328 @@
+<!-- templates/mark_attendance.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Mark Attendance</title>
+
+  <!-- Bootstrap for quick nice styling -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <style>
+    /* full-page background */
+    body, html {
+      height: 100%;
+      margin: 0;
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+    .bg {
+      background-image: url("{{ url_for('static', filename='images/bg.png') }}");
+      background-size: cover;
+      background-position: center;
+      height: 100%;
+      filter: brightness(0.9);
+    }
+
+    /* centered card on top of background */
+    .card-panel {
+      max-width: 1000px;
+      margin: 40px auto;
+      background: rgba(255,255,255,0.85);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+    }
+
+    /* overlay shown when access restricted */
+    #restrictedOverlay {
+      position: fixed;
+      inset: 0;
+      display: none; /* shown when needed */
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.6);
+      z-index: 9999;
+      text-align: center;
+      color: white;
+      padding: 20px;
+    }
+    #restrictedOverlay .box {
+      max-width: 800px;
+    }
+    #restrictedOverlay h1 {
+      font-size: 46px;
+      margin-bottom: 12px;
+    }
+    #restrictedOverlay p {
+      font-size: 20px;
+      opacity: 0.95;
+    }
+
+    /* video styling */
+    video { border-radius: 8px; border: 2px solid #ddd; background: black; }
+
+    /* small helper */
+    #status { margin-top: 10px; font-size: 14px; color: #444; }
+  </style>
+</head>
+<body>
+  <div class="bg">
+    <div class="card-panel container">
+      <div class="d-flex justify-content-between align-items-center">
+        <h3 class="m-0">Digital Face-Recognition Attendance System</h3>
+        <div>
+          <button id="refreshLocation" class="btn btn-sm btn-outline-secondary">Re-check Location</button>
+        </div>
+      </div>
+
+      <hr />
+
+      <div id="mainUI" style="display:none;">
+        <div class="row">
+          <div class="col-md-7 text-center">
+            <video id="video" width="560" height="420" autoplay playsinline muted></video>
+            <div id="status">Camera is off. Click Start to capture.</div>
+            <div class="mt-2">
+              <button id="startAttendance" class="btn btn-primary">Start Attendance</button>
+              <button id="stopAttendance" class="btn btn-danger" disabled>Stop</button>
+            </div>
+          </div>
+
+          <div class="col-md-5">
+            <h6>Session Recognized</h6>
+            <ul id="recognizedList" class="list-group"></ul>
+          </div>
+        </div>
+      </div>
+
+      <div id="waitingUI" class="text-center" style="padding:40px 0;">
+        <p class="text-muted">Requesting your location permission. Please allow location access to proceed.</p>
+        <div>
+          <button id="askAgain" class="btn btn-outline-primary">Ask for location permission</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ACCESS RESTRICTED OVERLAY -->
+  <div id="restrictedOverlay" class="d-flex">
+    <div class="box">
+      <h1>Access Restricted</h1>
+      <p id="restrictedMessage">You are outside the college radius. Go to college to mark attendance.</p>
+      <div class="mt-4">
+        <button id="recheckBtn" class="btn btn-light">Re-check Location</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  Flow:
+  1. On load, ask for geolocation (getCurrentPosition).
+  2. Send coords to server: POST /verify_location with {latitude, longitude}
+  3. If server says allowed -> show main UI (camera + Start).
+     If not allowed -> show restricted overlay with message.
+  4. If user denies permission -> show restricted overlay with message.
+*/
+
+const VERIFY_URL = '/verify_location';      // must be implemented server-side
+const MARK_URL = '/mark_attendance';        // where to send photo+coords if used
+const OUTSIDE_MSG = "You are outside the college radius. Go to college to mark attendance.";
+
+const mainUI = document.getElementById('mainUI');
+const waitingUI = document.getElementById('waitingUI');
+const restrictedOverlay = document.getElementById('restrictedOverlay');
+const restrictedMessage = document.getElementById('restrictedMessage');
+const recheckBtn = document.getElementById('recheckBtn');
+const askAgain = document.getElementById('askAgain');
+const refreshLocation = document.getElementById('refreshLocation');
+
+let lastCoords = null;
+let stream = null;
+let snapInterval = null;
+
+// helper: ask browser for location
+function requestLocationOnce() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error('Geolocation not supported by your browser.'));
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve(pos.coords),
+      err => reject(err),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
+}
+
+// verify with server
+async function verifyWithServer(coords) {
+  try {
+    const resp = await fetch(VERIFY_URL, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ latitude: coords.latitude, longitude: coords.longitude })
+    });
+    const json = await resp.json().catch(()=>({}));
+    return { ok: resp.ok, json };
+  } catch (e) {
+    return { ok: false, json: { message: 'Network error when verifying location.' } };
+  }
+}
+
+// show restricted overlay
+function showRestricted(message) {
+  restrictedMessage.textContent = message || OUTSIDE_MSG;
+  restrictedOverlay.style.display = 'flex';
+  mainUI.style.display = 'none';
+  waitingUI.style.display = 'none';
+  stopCamera();
+}
+
+// show main attendance UI
+function showMainUI() {
+  restrictedOverlay.style.display = 'none';
+  mainUI.style.display = 'block';
+  waitingUI.style.display = 'none';
+}
+
+// start camera
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+    const video = document.getElementById('video');
+    video.srcObject = stream;
+    video.play();
+    document.getElementById('status').textContent = 'Camera started. Click Start to send a snapshot.';
+  } catch (e) {
+    document.getElementById('status').textContent = 'Camera error or permission denied: ' + (e.message || e);
+  }
+}
+
+function stopCamera() {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  const video = document.getElementById('video');
+  if (video) { video.pause(); video.srcObject = null; }
+  document.getElementById('status').textContent = 'Camera stopped.';
+}
+
+// take snapshot (dataURL)
+function captureDataURL() {
+  const video = document.getElementById('video');
+  const w = video.videoWidth || 640;
+  const h = video.videoHeight || 480;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, w, h);
+  return canvas.toDataURL('image/jpeg', 0.9);
+}
+
+// upload snapshot to mark attendance (optional; your existing /mark_attendance handles it)
+async function uploadSnapshot(coords) {
+  const dataURL = captureDataURL();
+  const parts = dataURL.split(';base64,');
+  const contentType = parts[0].split(':')[1];
+  const raw = atob(parts[1]);
+  const u8 = new Uint8Array(raw.length);
+  for (let i=0;i<raw.length;i++) u8[i] = raw.charCodeAt(i);
+  const blob = new Blob([u8], { type: contentType });
+  const fd = new FormData();
+  fd.append('photo', blob, 'snap.jpg');
+  fd.append('latitude', coords.latitude);
+  fd.append('longitude', coords.longitude);
+
+  const resp = await fetch(MARK_URL, { method: 'POST', body: fd });
+  return resp.json().catch(()=>({ success:false, message:'Server error' }));
+}
+
+// initial flow: ask permission & verify
+async function initialFlow() {
+  waitingUI.style.display = 'block';
+  try {
+    const coords = await requestLocationOnce();
+    lastCoords = coords;
+    const { ok, json } = await verifyWithServer(coords);
+    if (!ok) {
+      // outside radius or server blocked
+      const msg = (json && json.message) ? json.message : OUTSIDE_MSG;
+      showRestricted(msg);
+      return;
+    }
+    // inside radius -> proceed
+    showMainUI();
+    // start camera ready, but do not auto-send unless you want
+    await startCamera();
+  } catch (err) {
+    // permission denied or timeout
+    const msg = (err && err.message) ? err.message : String(err);
+    showRestricted("Location permission denied or unavailable. " + "Please allow location access and re-check.");
+  }
+}
+
+// wire buttons
+document.getElementById('startAttendance').addEventListener('click', async () => {
+  if (!lastCoords) {
+    document.getElementById('status').textContent = 'Location missing. Re-checking...';
+    try {
+      lastCoords = await requestLocationOnce();
+    } catch (e) {
+      showRestricted("Location permission denied. Please allow location access.");
+      return;
+    }
+  }
+  document.getElementById('startAttendance').disabled = true;
+  document.getElementById('stopAttendance').disabled = false;
+  document.getElementById('status').textContent = 'Sending snapshot for recognition...';
+  try {
+    const res = await uploadSnapshot(lastCoords);
+    if (res.success) {
+      // show recognized user in list
+      const ul = document.getElementById('recognizedList');
+      const li = document.createElement('li');
+      li.className = 'list-group-item d-flex justify-content-between align-items-center';
+      li.textContent = `User: ${res.user_id || 'unknown'}`;
+      const span = document.createElement('span');
+      span.className = 'badge bg-primary rounded-pill';
+      span.textContent = Math.round((res.confidence||0)*100) + '%';
+      li.appendChild(span);
+      ul.prepend(li);
+      document.getElementById('status').textContent = 'Attendance marked ✅';
+    } else {
+      document.getElementById('status').textContent = res.message || 'Not recognized or blocked.';
+      if (res.reason === 'outside_radius') {
+        showRestricted(res.message || OUTSIDE_MSG);
+      }
+    }
+  } catch (e) {
+    document.getElementById('status').textContent = 'Upload failed: ' + e.message;
+  }
+});
+
+document.getElementById('stopAttendance').addEventListener('click', () => {
+  document.getElementById('startAttendance').disabled = false;
+  document.getElementById('stopAttendance').disabled = true;
+  stopCamera();
+});
+
+recheckBtn.addEventListener('click', async () => {
+  restrictedOverlay.style.display = 'none';
+  await initialFlow();
+});
+
+askAgain.addEventListener('click', async () => {
+  await initialFlow();
+});
+refreshLocation.addEventListener('click', async () => {
+  await initialFlow();
+});
+
+// run initial flow when page loads
+window.addEventListener('load', () => {
+  initialFlow();
+});
+</script>
+</body>
+</html>

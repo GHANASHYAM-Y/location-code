@@ -1,0 +1,140 @@
+<script>
+const COLLEGE_RADIUS_METERS = 1000; // change as needed
+
+async function getLocation() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject('Geolocation not supported');
+    navigator.geolocation.getCurrentPosition(
+      pos => resolve(pos.coords),
+      err => reject(err.message || 'Failed to get location'),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
+}
+
+function dataURLToBlob(dataURL) {
+  const parts = dataURL.split(';base64,');
+  const contentType = parts[0].split(':')[1];
+  const raw = atob(parts[1]);
+  const uInt8Array = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; ++i) uInt8Array[i] = raw.charCodeAt(i);
+  return new Blob([uInt8Array], { type: contentType });
+}
+
+async function capturePhoto() {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/jpeg', 0.9);
+}
+
+async function startCamera() {
+  const video = document.getElementById('video');
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  video.srcObject = stream;
+  video.style.display = 'block';
+  await new Promise(r => video.onloadedmetadata = r);
+  return stream;
+}
+
+function stopCamera() {
+  const video = document.getElementById('video');
+  const stream = video.srcObject;
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    video.srcObject = null;
+    video.style.display = 'none';
+  }
+}
+
+document.getElementById('startAttendance').addEventListener('click', async () => {
+  const statusEl = document.getElementById('status');
+  const btn = document.getElementById('startAttendance');
+
+  // Simple guard to avoid accidental double clicks
+  if (btn.disabled) return;
+  btn.disabled = true;
+
+  statusEl.textContent = 'Checking location...';
+
+  let streamStarted = false;
+
+  try {
+    const coords = await getLocation();
+
+    // server-side quick check
+    const resp = await fetch('/verify_location', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ latitude: coords.latitude, longitude: coords.longitude })
+    });
+
+    // attempt to parse JSON (server is expected to return JSON even on 403)
+    const json = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      // show server message if provided, otherwise fallback text
+      statusEl.textContent = json.message || `You are ${Math.round(json.distance||0)} meters away (outside allowed radius). Attendance blocked.`;
+      return;
+    }
+
+    // resp.ok === true
+    if (!json.allowed) {
+      statusEl.textContent = json.message || `You are ${Math.round(json.distance||0)} meters away (outside allowed radius). Attendance blocked.`;
+      return;
+    }
+
+    statusEl.textContent = 'Within college radius. Starting camera...';
+
+    // start camera and mark that it's active
+    try {
+      await startCamera();
+      streamStarted = true;
+    } catch (camErr) {
+      statusEl.textContent = 'Camera error or permission denied: ' + (camErr.message || camErr);
+      return;
+    }
+
+    await new Promise(r => setTimeout(r, 700)); // camera warm-up
+    const dataUrl = await capturePhoto();
+    const blob = dataURLToBlob(dataUrl);
+
+    // send photo + coords to server
+    const form = new FormData();
+    form.append('photo', blob, 'photo.jpg');
+    form.append('latitude', coords.latitude);
+    form.append('longitude', coords.longitude);
+
+    statusEl.textContent = 'Uploading for face recognition...';
+
+    const markResp = await fetch('/mark_attendance', {
+      method: 'POST',
+      body: form
+    });
+
+    const markJson = await markResp.json().catch(() => ({}));
+
+    if (!markResp.ok) {
+      // if server blocked due to outside radius or recognition failure, show message
+      statusEl.textContent = markJson.message || `Attendance failed: ${markJson.reason || 'unknown'}`;
+      return;
+    }
+
+    if (markJson.success) {
+      statusEl.textContent = 'Attendance marked ✅';
+    } else {
+      statusEl.textContent = markJson.message || 'Attendance failed: ' + (markJson.reason || 'unknown');
+    }
+
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + (err.message || err);
+  } finally {
+    // always stop camera if started and re-enable button
+    if (streamStarted) stopCamera();
+    btn.disabled = false;
+  }
+});
+</script>
